@@ -1,16 +1,15 @@
-﻿using System;
-using System.Collections.Generic;
+﻿#if !MONO
+using System;
 using System.IO;
-using System.Linq;
 using System.Reflection;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Media.Effects;
 using System.Windows.Media.Imaging;
+using System.Windows.Shell;
 using WpfAnimatedGif;
 
 namespace Squirrel.Update
@@ -42,10 +41,15 @@ namespace Squirrel.Update
             this.WindowStyle = WindowStyle.None;
             this.WindowStartupLocation = WindowStartupLocation.CenterScreen;
             this.ShowInTaskbar = true;
+            this.Topmost = true;
+            this.TaskbarItemInfo = new TaskbarItemInfo {
+                ProgressState = TaskbarItemProgressState.Normal
+            };
+            this.Title = "Installing...";
             this.Background = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0));
         }
 
-        public static void ShowWindow(TimeSpan initialDelay, CancellationToken token)
+        public static void ShowWindow(TimeSpan initialDelay, CancellationToken token, ProgressSource progressSource)
         {
             var wnd = default(AnimatedGifWindow);
 
@@ -61,12 +65,33 @@ namespace Squirrel.Update
                 wnd = new AnimatedGifWindow();
                 wnd.Show();
 
+                Task.Delay(TimeSpan.FromSeconds(5.0), token).ContinueWith(t => {
+                    if (t.IsCanceled) return;
+                    wnd.Dispatcher.BeginInvoke(new Action(() => wnd.Topmost = false));
+                });
+
                 token.Register(() => wnd.Dispatcher.BeginInvoke(new Action(wnd.Close)));
-                (new Application()).Run(wnd);
+                EventHandler<int> progressSourceOnProgress = ((sender, p) =>
+                    wnd.Dispatcher.BeginInvoke(
+                        new Action(() => wnd.TaskbarItemInfo.ProgressValue = p/100.0)));
+                progressSource.Progress += progressSourceOnProgress;
+                try {
+                    (new Application()).Run(wnd);
+                } finally {
+                    progressSource.Progress -= progressSourceOnProgress;
+                }
             });
 
             thread.SetApartmentState(ApartmentState.STA);
             thread.Start();
         }
+
+        protected override void OnMouseLeftButtonDown(MouseButtonEventArgs e)
+        {
+            base.OnMouseLeftButtonDown(e);
+            this.DragMove();
+        }
     }
 }
+
+#endif

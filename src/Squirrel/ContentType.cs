@@ -6,10 +6,27 @@ namespace Squirrel
 {
     internal static class ContentType
     {
+        public static void Clean(XmlDocument doc)
+        {
+            var typesElement = doc.FirstChild.NextSibling;
+            if (typesElement.Name.ToLowerInvariant() != "types") {
+                throw new Exception("Invalid ContentTypes file, expected root node should be 'Types'");
+            }
+
+            var children = typesElement.ChildNodes.OfType<XmlElement>();
+
+            foreach (var child in children) {
+                if (child.GetAttribute("Extension") == "") {
+                    typesElement.RemoveChild(child);
+                }
+            }
+        }
+
         public static void Merge(XmlDocument doc)
         {
             var elements = new [] {
                 Tuple.Create("Default", "diff", "application/octet" ),
+                Tuple.Create("Default", "bsdiff", "application/octet" ),
                 Tuple.Create("Default", "exe", "application/octet" ),
                 Tuple.Create("Default", "dll", "application/octet" ),
                 Tuple.Create("Default", "shasum", "text/plain" ),

@@ -15,9 +15,6 @@ namespace Squirrel
         {
             readonly string rootAppDirectory;
 
-            // TODO: rip this out
-            readonly FrameworkVersion appFrameworkVersion = FrameworkVersion.Net45;
-
             public CheckForUpdateImpl(string rootAppDirectory)
             {
                 this.rootAppDirectory = rootAppDirectory;
@@ -26,13 +23,14 @@ namespace Squirrel
             public async Task<UpdateInfo> CheckForUpdate(
                 string localReleaseFile,
                 string updateUrlOrPath,
-                bool ignoreDeltaUpdates = false, 
+                bool ignoreDeltaUpdates = false,
                 Action<int> progress = null,
                 IFileDownloader urlDownloader = null)
             {
                 progress = progress ?? (_ => { });
 
                 var localReleases = Enumerable.Empty<ReleaseEntry>();
+                var stagingId = getOrCreateStagedUserId();
 
                 bool shouldInitialize = false;
                 try {
@@ -47,7 +45,11 @@ namespace Squirrel
 
                 string releaseFile;
 
-                // Fetch the remote RELEASES file, whether it's a local dir or an 
+                var latestLocalRelease = localReleases.Count() > 0 ?
+                    localReleases.MaxBy(x => x.Version).First() :
+                    default(ReleaseEntry);
+
+                // Fetch the remote RELEASES file, whether it's a local dir or an
                 // HTTP URL
                 if (Utility.IsHttpUrl(updateUrlOrPath)) {
                     if (updateUrlOrPath.EndsWith("/")) {
@@ -61,7 +63,17 @@ namespace Squirrel
                 retry:
 
                     try {
-                        var data = await urlDownloader.DownloadUrl(String.Format("{0}/{1}", updateUrlOrPath, "RELEASES"));
+                        var uri = Utility.AppendPathToUri(new Uri(updateUrlOrPath), "RELEASES");
+
+                        if (latestLocalRelease != null) {
+                            uri = Utility.AddQueryParamsToUri(uri, new Dictionary<string, string> {
+                                { "id", latestLocalRelease.PackageName },
+                                { "localVersion", latestLocalRelease.Version.ToString() },
+                                { "arch", Environment.Is64BitOperatingSystem ? "amd64" : "x86" }
+                            });
+                        }
+
+                        var data = await urlDownloader.DownloadUrl(uri.ToString());
                         releaseFile = Encoding.UTF8.GetString(data);
                     } catch (WebException ex) {
                         this.Log().InfoException("Download resulted in WebException (returning blank release list)", ex);
@@ -77,7 +89,7 @@ namespace Squirrel
 
                     if (!Directory.Exists(updateUrlOrPath)) {
                         var message = String.Format(
-                            "The directory {0} does not exist, something is probably broken with your application", 
+                            "The directory {0} does not exist, something is probably broken with your application",
                             updateUrlOrPath);
 
                         throw new Exception(message);
@@ -86,7 +98,7 @@ namespace Squirrel
                     var fi = new FileInfo(Path.Combine(updateUrlOrPath, "RELEASES"));
                     if (!fi.Exists) {
                         var message = String.Format(
-                            "The file {0} does not exist, something is probably broken with your application", 
+                            "The file {0} does not exist, something is probably broken with your application",
                             fi.FullName);
 
                         this.Log().Warn(message);
@@ -106,7 +118,7 @@ namespace Squirrel
                 }
 
                 var ret = default(UpdateInfo);
-                var remoteReleases = ReleaseEntry.ParseReleaseFile(releaseFile); 
+                var remoteReleases = ReleaseEntry.ParseReleaseFileAndApplyStaging(releaseFile, stagingId);
                 progress(66);
 
                 if (!remoteReleases.Any()) {
@@ -114,7 +126,7 @@ namespace Squirrel
                 }
 
                 ret = determineUpdateInfo(localReleases, remoteReleases, ignoreDeltaUpdates);
-                
+
                 progress(100);
                 return ret;
             }
@@ -146,7 +158,7 @@ namespace Squirrel
                 if (latestFullRelease == currentRelease) {
                     this.Log().Info("No updates, remote and local are the same");
 
-                    var info = UpdateInfo.Create(currentRelease, new[] {latestFullRelease}, packageDirectory, appFrameworkVersion);
+                    var info = UpdateInfo.Create(currentRelease, new[] {latestFullRelease}, packageDirectory);
                     return info;
                 }
 
@@ -156,15 +168,46 @@ namespace Squirrel
 
                 if (!localReleases.Any()) {
                     this.Log().Warn("First run or local directory is corrupt, starting from scratch");
-                    return UpdateInfo.Create(Utility.FindCurrentVersion(localReleases), new[] {latestFullRelease}, packageDirectory, appFrameworkVersion);
+                    return UpdateInfo.Create(Utility.FindCurrentVersion(localReleases), new[] {latestFullRelease}, packageDirectory);
                 }
 
                 if (localReleases.Max(x => x.Version) > remoteReleases.Max(x => x.Version)) {
                     this.Log().Warn("hwhat, local version is greater than remote version");
-                    return UpdateInfo.Create(Utility.FindCurrentVersion(localReleases), new[] {latestFullRelease}, packageDirectory, appFrameworkVersion);
+                    return UpdateInfo.Create(Utility.FindCurrentVersion(localReleases), new[] {latestFullRelease}, packageDirectory);
                 }
 
-                return UpdateInfo.Create(currentRelease, remoteReleases, packageDirectory, appFrameworkVersion);
+                return UpdateInfo.Create(currentRelease, remoteReleases, packageDirectory);
+            }
+
+            internal Guid? getOrCreateStagedUserId()
+            {
+                var stagedUserIdFile = Path.Combine(rootAppDirectory, "packages", ".betaId");
+                var ret = default(Guid);
+
+                try {
+                    if (!Guid.TryParse(File.ReadAllText(stagedUserIdFile, Encoding.UTF8), out ret)) {
+                        throw new Exception("File was read but contents were invalid");
+                    }
+
+                    this.Log().Info("Using existing staging user ID: {0}", ret.ToString());
+                    return ret;
+                } catch (Exception ex) {
+                    this.Log().DebugException("Couldn't read staging user ID, creating a blank one", ex);
+                }
+
+                var prng = new Random();
+                var buf = new byte[4096];
+                prng.NextBytes(buf);
+
+                ret = Utility.CreateGuidFromHash(buf);
+                try {
+                    File.WriteAllText(stagedUserIdFile, ret.ToString(), Encoding.UTF8);
+                    this.Log().Info("Generated new staging user ID: {0}", ret.ToString());
+                    return ret;
+                } catch (Exception ex) {
+                    this.Log().WarnException("Couldn't write out staging user ID, this user probably shouldn't get beta anything", ex);
+                    return null;
+                }
             }
         }
     }

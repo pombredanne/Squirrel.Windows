@@ -16,6 +16,7 @@ using System.Threading.Tasks;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
+using NuGet;
 
 namespace Squirrel
 {
@@ -176,23 +177,37 @@ namespace Squirrel
             }
         }
 
-        public static Task<Tuple<int, string>> InvokeProcessAsync(string fileName, string arguments)
+        public static Task<Tuple<int, string>> InvokeProcessAsync(string fileName, string arguments, CancellationToken ct, string workingDirectory = "")
         {
             var psi = new ProcessStartInfo(fileName, arguments);
+            if (Environment.OSVersion.Platform != PlatformID.Win32NT && fileName.EndsWith (".exe", StringComparison.OrdinalIgnoreCase)) {
+                psi = new ProcessStartInfo("wine", fileName + " " + arguments);
+            }
+
             psi.UseShellExecute = false;
             psi.WindowStyle = ProcessWindowStyle.Hidden;
             psi.ErrorDialog = false;
             psi.CreateNoWindow = true;
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
+            psi.WorkingDirectory = workingDirectory;
 
-            return InvokeProcessAsync(psi);
+            return InvokeProcessAsync(psi, ct);
         }
 
-        public static async Task<Tuple<int, string>> InvokeProcessAsync(ProcessStartInfo psi)
+        public static async Task<Tuple<int, string>> InvokeProcessAsync(ProcessStartInfo psi, CancellationToken ct)
         {
             var pi = Process.Start(psi);
-            await Task.Run(() => pi.WaitForExit());
+            await Task.Run(() => {
+                while (!ct.IsCancellationRequested) {
+                    if (pi.WaitForExit(2000)) return;
+                }
+
+                if (ct.IsCancellationRequested) {
+                    pi.Kill();
+                    ct.ThrowIfCancellationRequested();
+                }
+            });
 
             string textResult = await pi.StandardOutput.ReadToEndAsync();
             if (String.IsNullOrWhiteSpace(textResult)) {
@@ -220,24 +235,43 @@ namespace Squirrel
                 }));
         }
 
-        static string directoryChars;
-        public static IDisposable WithTempDirectory(out string path)
+        static Lazy<string> directoryChars = new Lazy<string>(() => {
+            return "abcdefghijklmnopqrstuvwxyz" +
+                Enumerable.Range(0x03B0, 0x03FF - 0x03B0)   // Greek and Coptic
+                    .Concat(Enumerable.Range(0x0400, 0x04FF - 0x0400)) // Cyrillic
+                    .Aggregate(new StringBuilder(), (acc, x) => { acc.Append(Char.ConvertFromUtf32(x)); return acc; })
+                    .ToString();
+        });
+
+        internal static string tempNameForIndex(int index, string prefix)
         {
-            var di = new DirectoryInfo(Environment.GetEnvironmentVariable("SQUIRREL_TEMP") ?? Environment.GetEnvironmentVariable("TEMP") ?? "");
-            if (!di.Exists) {
-                throw new Exception("%TEMP% isn't defined, go set it");
+            if (index < directoryChars.Value.Length) {
+                return prefix + directoryChars.Value[index];
             }
 
+            return prefix + directoryChars.Value[index % directoryChars.Value.Length] + tempNameForIndex(index / directoryChars.Value.Length, "");
+        }
+
+        public static DirectoryInfo GetTempDirectory(string localAppDirectory)
+        {
+            var tempDir = Environment.GetEnvironmentVariable("SQUIRREL_TEMP");
+            tempDir = tempDir ?? Path.Combine(localAppDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SquirrelTemp");
+
+            var di = new DirectoryInfo(tempDir);
+            if (!di.Exists) di.Create();
+
+            return di;
+        }
+
+        public static IDisposable WithTempDirectory(out string path, string localAppDirectory = null)
+        {
+            var di = GetTempDirectory(localAppDirectory);
             var tempDir = default(DirectoryInfo);
 
-            directoryChars = directoryChars ?? (
-                "abcdefghijklmnopqrstuvwxyz" +
-                Enumerable.Range(0x4E00, 0x9FCC - 0x4E00)  // CJK UNIFIED IDEOGRAPHS
-                    .Aggregate(new StringBuilder(), (acc, x) => { acc.Append(Char.ConvertFromUtf32(x)); return acc; })
-                    .ToString());
+            var names = Enumerable.Range(0, 1<<20).Select(x => tempNameForIndex(x, "temp"));
 
-            foreach (var c in directoryChars) {
-                var target = Path.Combine(di.FullName, c.ToString());
+            foreach (var name in names) {
+                var target = Path.Combine(di.FullName, name);
 
                 if (!File.Exists(target) && !Directory.Exists(target)) {
                     Directory.CreateDirectory(target);
@@ -251,11 +285,29 @@ namespace Squirrel
             return Disposable.Create(() => Task.Run(async () => await DeleteDirectory(tempDir.FullName)).Wait());
         }
 
+        public static IDisposable WithTempFile(out string path, string localAppDirectory = null)
+        {
+            var di = GetTempDirectory(localAppDirectory);
+            var names = Enumerable.Range(0, 1<<20).Select(x => tempNameForIndex(x, "temp"));
+
+            path = "";
+            foreach (var name in names) {
+                path = Path.Combine(di.FullName, name);
+
+                if (!File.Exists(path) && !Directory.Exists(path)) {
+                    break;
+                }
+            }
+
+            var thePath = path;
+            return Disposable.Create(() => File.Delete(thePath));
+        }
+
         public static async Task DeleteDirectory(string directoryPath)
         {
             Contract.Requires(!String.IsNullOrEmpty(directoryPath));
 
-            Log().Info("Starting to delete folder: {0}", directoryPath);
+            Log().Debug("Starting to delete folder: {0}", directoryPath);
 
             if (!Directory.Exists(directoryPath)) {
                 Log().Warn("DeleteDirectory: does not exist - {0}", directoryPath);
@@ -300,15 +352,14 @@ namespace Squirrel
             }
         }
 
-        public static Tuple<string, Stream> CreateTempFile()
-        {
-            var path = Path.GetTempFileName();
-            return Tuple.Create(path, (Stream) File.OpenWrite(path));
-        }
-
         public static string AppDirForRelease(string rootAppDirectory, ReleaseEntry entry)
         {
             return Path.Combine(rootAppDirectory, "app-" + entry.Version.ToString());
+        }
+
+        public static string AppDirForVersion(string rootAppDirectory, SemanticVersion version)
+        {
+            return Path.Combine(rootAppDirectory, "app-" + version.ToString());
         }
 
         public static string PackageDirectoryForAppDir(string rootAppDirectory) 
@@ -362,42 +413,55 @@ namespace Squirrel
             return uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps;
         }
 
-        public static async Task DeleteDirectoryWithFallbackToNextReboot(string dir)
+        public static Uri AppendPathToUri(Uri uri, string path)
+        {
+            var builder = new UriBuilder(uri);
+            if (!builder.Path.EndsWith("/")) {
+                builder.Path += "/";
+            }
+
+            builder.Path += path;
+            return builder.Uri;
+        }
+
+        public static Uri EnsureTrailingSlash(Uri uri)
+        {
+            return AppendPathToUri(uri, "");
+        }
+
+        public static Uri AddQueryParamsToUri(Uri uri, IEnumerable<KeyValuePair<string, string>> newQuery)
+        {
+            var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+
+            foreach (var entry in newQuery) {
+                query[entry.Key] = entry.Value;
+            }
+
+            var builder = new UriBuilder(uri);
+            builder.Query = query.ToString();
+
+            return builder.Uri;
+        }
+
+        public static void DeleteFileHarder(string path, bool ignoreIfFails = false)
+        {
+            try {
+                Retry(() => File.Delete(path), 2);
+            } catch (Exception ex) {
+                if (ignoreIfFails) return;
+
+                LogHost.Default.ErrorException("Really couldn't delete file: " + path, ex);
+                throw;
+            }
+        }
+
+        public static async Task DeleteDirectoryOrJustGiveUp(string dir)
         {
             try {
                 await Utility.DeleteDirectory(dir);
             } catch (Exception ex) {
-                var message = String.Format("Uninstall failed to delete dir '{0}', punting to next reboot", dir);
-                LogHost.Default.WarnException(message, ex);
-
-                Utility.DeleteDirectoryAtNextReboot(dir);
+                var message = String.Format("Uninstall failed to delete dir '{0}'", dir);
             }
-        }
-
-        public static void DeleteDirectoryAtNextReboot(string directoryPath)
-        {
-            var di = new DirectoryInfo(directoryPath);
-
-            if (!di.Exists) {
-                Log().Warn("DeleteDirectoryAtNextReboot: does not exist - {0}", directoryPath);
-                return;
-            }
-
-            // NB: MoveFileEx blows up if you're a non-admin, so you always need a backup plan
-            di.GetFiles().ForEach(x => safeDeleteFileAtNextReboot(x.FullName));
-            di.GetDirectories().ForEach(x => DeleteDirectoryAtNextReboot(x.FullName));
-
-            safeDeleteFileAtNextReboot(directoryPath);
-        }
-
-        static void safeDeleteFileAtNextReboot(string name)
-        {
-            if (MoveFileEx(name, null, MoveFileFlags.MOVEFILE_DELAY_UNTIL_REBOOT)) return;
-
-            // Thank You, http://www.pinvoke.net/default.aspx/coredll.getlasterror
-            var lastError = Marshal.GetLastWin32Error();
-
-            Log().Error("safeDeleteFileAtNextReboot: failed - {0} - {1}", name, lastError);
         }
 
         public static void LogIfThrows(this IFullLogger This, LogLevel level, string message, Action block)
@@ -520,6 +584,124 @@ namespace Squirrel
             MOVEFILE_CREATE_HARDLINK = 0x00000010,
             MOVEFILE_FAIL_IF_NOT_TRACKABLE = 0x00000020
         }
+
+        public static Guid CreateGuidFromHash(string text)
+        {
+            return CreateGuidFromHash(text, Utility.IsoOidNamespace);
+        }
+        public static Guid CreateGuidFromHash(byte[] data)
+        {
+            return CreateGuidFromHash(data, Utility.IsoOidNamespace);
+        }
+
+        public static Guid CreateGuidFromHash(string text, Guid namespaceId)
+        {
+            return CreateGuidFromHash(Encoding.UTF8.GetBytes(text), namespaceId);
+        }
+
+        public static Guid CreateGuidFromHash(byte[] nameBytes, Guid namespaceId)
+        {
+            // convert the namespace UUID to network order (step 3)
+            byte[] namespaceBytes = namespaceId.ToByteArray();
+            SwapByteOrder(namespaceBytes);
+
+            // comput the hash of the name space ID concatenated with the 
+            // name (step 4)
+            byte[] hash;
+            using (var algorithm = SHA1.Create()) {
+                algorithm.TransformBlock(namespaceBytes, 0, namespaceBytes.Length, null, 0);
+                algorithm.TransformFinalBlock(nameBytes, 0, nameBytes.Length);
+                hash = algorithm.Hash;
+            }
+
+            // most bytes from the hash are copied straight to the bytes of 
+            // the new GUID (steps 5-7, 9, 11-12)
+            var newGuid = new byte[16];
+            Array.Copy(hash, 0, newGuid, 0, 16);
+
+            // set the four most significant bits (bits 12 through 15) of 
+            // the time_hi_and_version field to the appropriate 4-bit 
+            // version number from Section 4.1.3 (step 8)
+            newGuid[6] = (byte)((newGuid[6] & 0x0F) | (5 << 4));
+
+            // set the two most significant bits (bits 6 and 7) of the 
+            // clock_seq_hi_and_reserved to zero and one, respectively 
+            // (step 10)
+            newGuid[8] = (byte)((newGuid[8] & 0x3F) | 0x80);
+
+            // convert the resulting UUID to local byte order (step 13)
+            SwapByteOrder(newGuid);
+            return new Guid(newGuid);
+        }
+
+        /// <summary>
+        /// The namespace for fully-qualified domain names (from RFC 4122, Appendix C).
+        /// </summary>
+        public static readonly Guid DnsNamespace = new Guid("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+
+        /// <summary>
+        /// The namespace for URLs (from RFC 4122, Appendix C).
+        /// </summary>
+        public static readonly Guid UrlNamespace = new Guid("6ba7b811-9dad-11d1-80b4-00c04fd430c8");
+
+        /// <summary>
+        /// The namespace for ISO OIDs (from RFC 4122, Appendix C).
+        /// </summary>
+        public static readonly Guid IsoOidNamespace = new Guid("6ba7b812-9dad-11d1-80b4-00c04fd430c8");
+
+        // Converts a GUID (expressed as a byte array) to/from network order (MSB-first).
+        static void SwapByteOrder(byte[] guid)
+        {
+            SwapBytes(guid, 0, 3);
+            SwapBytes(guid, 1, 2);
+            SwapBytes(guid, 4, 5);
+            SwapBytes(guid, 6, 7);
+        }
+
+        static void SwapBytes(byte[] guid, int left, int right)
+        {
+            byte temp = guid[left];
+            guid[left] = guid[right];
+            guid[right] = temp;
+        }
+    }
+
+    static unsafe class UnsafeUtility
+    {
+        public static List<Tuple<string, int>> EnumerateProcesses()
+        {
+            int length = 0;
+            var pids = new int[2048];
+
+            fixed(int* p = pids) {
+                if (!NativeMethods.EnumProcesses((IntPtr)p, sizeof(int) * pids.Length, out length)) {
+                    throw new Win32Exception("Failed to enumerate processes");
+                }
+
+                if (length < 1) throw new Exception("Failed to enumerate processes");
+            }
+
+            return Enumerable.Range(0, length)
+                .Where(i => pids[i] > 0)
+                .Select(i => {
+                    try {
+                        var hProcess = NativeMethods.OpenProcess(ProcessAccess.QueryLimitedInformation, false, pids[i]);
+                        if (hProcess == IntPtr.Zero) throw new Win32Exception();
+
+                        var sb = new StringBuilder(256);
+                        var capacity = sb.Capacity;
+                        if (!NativeMethods.QueryFullProcessImageName(hProcess, 0, sb, ref capacity)) {
+                            throw new Win32Exception();
+                        }
+
+                        NativeMethods.CloseHandle(hProcess);
+                        return Tuple.Create(sb.ToString(), pids[i]);
+                    } catch (Exception) {
+                        return Tuple.Create(default(string), pids[i]);
+                    }
+                })
+                .ToList();
+        }
     }
 
     sealed class SingleGlobalInstance : IDisposable, IEnableLogger
@@ -555,7 +737,7 @@ namespace Squirrel
                 throw new Exception("Couldn't acquire lock, is another instance running");
             }
 
-            var handle = Disposable.Create(() => {
+            handle = Disposable.Create(() => {
                 fh.Dispose();
                 File.Delete(path);
             });

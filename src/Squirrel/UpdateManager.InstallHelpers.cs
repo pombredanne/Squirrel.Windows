@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using Microsoft.Win32;
 using NuGet;
 using Splat;
+using System.Reflection;
 
 namespace Squirrel
 {
@@ -32,7 +33,7 @@ namespace Squirrel
             {
                 var releaseContent = File.ReadAllText(Path.Combine(rootAppDirectory, "packages", "RELEASES"), Encoding.UTF8);
                 var releases = ReleaseEntry.ParseReleaseFile(releaseContent);
-                var latest = releases.OrderByDescending(x => x.Version).First();
+                var latest = releases.Where(x => !x.IsDelta).OrderByDescending(x => x.Version).First();
 
                 // Download the icon and PNG => ICO it. If this doesn't work, who cares
                 var pkgPath = Path.Combine(rootAppDirectory, "packages", latest.Filename);
@@ -51,21 +52,21 @@ namespace Squirrel
 
                 if (zp.IconUrl != null && !File.Exists(targetIco)) {
                     try {
-                        var wc = Utility.CreateWebClient();
-
-                        await wc.DownloadFileTaskAsync(zp.IconUrl, targetPng);
-                        using (var fs = new FileStream(targetIco, FileMode.Create)) {
-                            if (zp.IconUrl.AbsolutePath.EndsWith("ico")) {
-                                var bytes = File.ReadAllBytes(targetPng);
-                                fs.Write(bytes, 0, bytes.Length);
-                            } else {
-                                using (var bmp = (Bitmap)Image.FromFile(targetPng))
-                                using (var ico = Icon.FromHandle(bmp.GetHicon())) {
-                                    ico.Save(fs);
+                        using (var wc = Utility.CreateWebClient()) { 
+                            await wc.DownloadFileTaskAsync(zp.IconUrl, targetPng);
+                            using (var fs = new FileStream(targetIco, FileMode.Create)) {
+                                if (zp.IconUrl.AbsolutePath.EndsWith("ico")) {
+                                    var bytes = File.ReadAllBytes(targetPng);
+                                    fs.Write(bytes, 0, bytes.Length);
+                                } else {
+                                    using (var bmp = (Bitmap)Image.FromFile(targetPng))
+                                    using (var ico = Icon.FromHandle(bmp.GetHicon())) {
+                                        ico.Save(fs);
+                                    }
                                 }
-                            }
 
-                            key.SetValue("DisplayIcon", targetIco, RegistryValueKind.String);
+                                key.SetValue("DisplayIcon", targetIco, RegistryValueKind.String);
+                            }
                         }
                     } catch(Exception ex) {
                         this.Log().InfoException("Couldn't write uninstall icon, don't care", ex);
@@ -77,9 +78,9 @@ namespace Squirrel
                 var stringsToWrite = new[] {
                     new { Key = "DisplayName", Value = zp.Title ?? zp.Description ?? zp.Summary },
                     new { Key = "DisplayVersion", Value = zp.Version.ToString() },
-                    new { Key = "InstallDate", Value = DateTime.Now.ToString("yyyymmdd") },
+                    new { Key = "InstallDate", Value = DateTime.Now.ToString("yyyyMMdd") },
                     new { Key = "InstallLocation", Value = rootAppDirectory },
-                    new { Key = "Publisher", Value = zp.Authors.First() },
+                    new { Key = "Publisher", Value = String.Join(",", zp.Authors) },
                     new { Key = "QuietUninstallString", Value = String.Format("{0} {1}", uninstallCmd, quietSwitch) },
                     new { Key = "UninstallString", Value = uninstallCmd },
                     new { Key = "URLUpdateInfo", Value = zp.ProjectUrl != null ? zp.ProjectUrl.ToString() : "", }
@@ -100,6 +101,35 @@ namespace Squirrel
                 }
 
                 return key;
+            }
+
+            public void KillAllProcessesBelongingToPackage()
+            {
+                var ourExe = Assembly.GetEntryAssembly();
+                var ourExePath = ourExe != null ? ourExe.Location : null;
+
+                UnsafeUtility.EnumerateProcesses()
+                    .Where(x => {
+                        // Processes we can't query will have an empty process name, we can't kill them
+                        // anyways
+                        if (String.IsNullOrWhiteSpace(x.Item1)) return false;
+
+                        // Files that aren't in our root app directory are untouched
+                        if (!x.Item1.StartsWith(rootAppDirectory, StringComparison.OrdinalIgnoreCase)) return false;
+
+                        // Never kill our own EXE
+                        if (ourExePath != null && x.Item1.Equals(ourExePath, StringComparison.OrdinalIgnoreCase)) return false;
+
+                        var name = Path.GetFileName(x.Item1).ToLowerInvariant();
+                        if (name == "squirrel.exe" || name == "update.exe") return false;
+
+                        return true;
+                    })
+                    .ForEach(x => {
+                        try {
+                            this.WarnIfThrows(() => Process.GetProcessById(x.Item2).Kill());
+                        } catch {}
+                    });
             }
 
             public Task<RegistryKey> CreateUninstallerRegistryEntry()
